@@ -35,6 +35,7 @@ jobs:
             java: corretto@17
           - scala: 2.12
             java: corretto@21
+    if: github.repository_owner == 'spotify'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
