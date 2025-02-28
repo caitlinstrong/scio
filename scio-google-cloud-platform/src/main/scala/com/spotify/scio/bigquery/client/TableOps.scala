@@ -31,7 +31,7 @@ import org.apache.avro.Schema
 import org.apache.avro.generic.{GenericDatumReader, GenericRecord}
 import org.apache.avro.io.{BinaryDecoder, DecoderFactory}
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.Write.{CreateDisposition, WriteDisposition}
-import org.apache.beam.sdk.io.gcp.bigquery.{BigQueryAvroUtilsWrapper, BigQueryOptions}
+import org.apache.beam.sdk.io.gcp.bigquery.{BigQueryOptions, BigQueryUtils}
 import org.apache.beam.sdk.io.gcp.{bigquery => bq}
 import org.apache.beam.sdk.options.{ExecutorOptions, PipelineOptionsFactory}
 import org.joda.time.Instant
@@ -39,6 +39,7 @@ import org.joda.time.format.DateTimeFormat
 import org.slf4j.LoggerFactory
 
 import scala.collection.mutable.ArrayBuffer
+import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
 import scala.util.Random
 import scala.util.control.NonFatal
@@ -66,11 +67,8 @@ final private[client] class TableOps(client: Client) {
     storageAvroRows(table, TableReadOptions.getDefaultInstance)
 
   def storageRows(table: STable, readOptions: TableReadOptions): Iterator[TableRow] =
-    withBigQueryService { bqServices =>
-      val tb = bqServices.getTable(table.ref, readOptions.getSelectedFieldsList)
-      storageAvroRows(table, readOptions).map { gr =>
-        BigQueryAvroUtilsWrapper.convertGenericRecordToTableRow(gr, tb.getSchema)
-      }
+    storageAvroRows(table, readOptions).map { gr =>
+      BigQueryUtils.convertGenericRecordToTableRow(gr)
     }
 
   def storageAvroRows(table: STable, readOptions: TableReadOptions): Iterator[GenericRecord] = {
@@ -239,14 +237,26 @@ final private[client] class TableOps(client: Client) {
     createDisposition: CreateDisposition
   ): Long = withBigQueryService { service =>
     val table = new Table().setTableReference(tableReference).setSchema(schema)
-    if (createDisposition == CreateDisposition.CREATE_IF_NEEDED) {
+    if (
+      createDisposition == CreateDisposition.CREATE_IF_NEEDED &&
+      service.getTable(tableReference) == null
+    ) {
       service.createTable(table)
+      // wait creation to be effective before inserting
+      Thread.sleep(10.seconds.toMillis)
     }
 
     writeDisposition match {
       case WriteDisposition.WRITE_TRUNCATE =>
-        delete(tableReference)
-        service.createTable(table)
+        if (!service.isTableEmpty(tableReference)) {
+          delete(tableReference)
+          // wait deletion to be effective before re-creating
+          Thread.sleep(10.seconds.toMillis)
+
+          service.createTable(table)
+          // wait creation to be effective before inserting
+          Thread.sleep(10.seconds.toMillis)
+        }
       case WriteDisposition.WRITE_EMPTY =>
         require(service.isTableEmpty(tableReference))
       case WriteDisposition.WRITE_APPEND =>
