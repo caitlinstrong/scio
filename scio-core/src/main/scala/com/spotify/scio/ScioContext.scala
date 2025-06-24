@@ -699,10 +699,8 @@ class ScioContext private[scio] (
         }
 
         new ScioResult(pipelineResult) {
-          private val metricsLocation = sc.optionsAs[ScioOptions].getMetricsLocation
-          if (metricsLocation != null) {
-            saveMetrics(metricsLocation)
-          }
+          Option(sc.optionsAs[ScioOptions].getMetricsLocation).foreach(saveMetrics)
+          Option(sc.optionsAs[ScioOptions].getLineageLocation).foreach(saveLineage)
 
           override def getMetrics: Metrics =
             Metrics(
@@ -872,7 +870,7 @@ class ScioContext private[scio] (
   def unionAll[T: Coder](scs: => Iterable[SCollection[T]]): SCollection[T] = {
     val tfName = this.tfName // evaluate eagerly to avoid overriding `scs` names
     scs match {
-      case Nil => empty()
+      case Nil      => empty()
       case contents =>
         wrap(
           PCollectionList

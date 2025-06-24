@@ -20,10 +20,12 @@ package com.spotify.scio.bigquery
 import com.google.protobuf.ByteString
 import com.spotify.scio.avro._
 import com.spotify.scio.coders.Coder
+import com.spotify.scio.bigquery._
 import com.spotify.scio.bigquery.BigQueryTypedTable.Format
-import com.spotify.scio.bigquery.BigQueryTypedTable.Format.GenericRecordWithLogicalTypes
 import com.spotify.scio.bigquery.client.BigQuery
+import com.spotify.scio.bigquery.types.BigQueryType.HasAnnotation
 import com.spotify.scio.bigquery.types.{BigNumeric, Geography, Json}
+import com.spotify.scio.bigquery.validation._
 import com.spotify.scio.testing._
 import magnolify.scalacheck.auto._
 import org.apache.avro.UnresolvedUnionException
@@ -32,10 +34,13 @@ import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.Write.{Method => WriteMeth
 import org.apache.beam.sdk.options.PipelineOptionsFactory
 import org.joda.time.{Instant, LocalDate, LocalDateTime, LocalTime}
 import org.joda.time.format.DateTimeFormat
+import org.apache.beam.sdk.Pipeline.PipelineExecutionException
 import org.scalacheck._
 import org.scalatest.BeforeAndAfterAll
 
-import scala.util.{Random, Try}
+import scala.jdk.CollectionConverters._
+import scala.util.Random
+import scala.reflect.runtime.universe._
 
 object TypedBigQueryIT {
   case class Nested(int: Int)
@@ -53,16 +58,36 @@ object TypedBigQueryIT {
     timestamp: Instant,
     date: LocalDate,
     time: LocalTime,
-    // BQ DATETIME is problematic with avro as BQ api uses different representations:
-    // - BQ export uses 'string(datetime)'
-    // - BQ load uses 'long(local-timestamp-micros)'
-    // BigQueryType avroSchema favors read with string type
-    // datetime: LocalDateTime,
+    datetime: LocalDateTime,
     geography: Geography,
-    json: Json,
     bigNumeric: BigNumeric,
     nestedRequired: Nested,
-    nestedOptional: Option[Nested]
+    nestedOptional: Option[Nested],
+    @description("COUNTRY") country: Country
+  )
+
+  @BigQueryType.toTable
+  case class JsonRecord(
+    json: Json
+  )
+
+  @BigQueryType.toTable
+  case class RecordNoTime(
+    bool: Boolean,
+    int: Int,
+    long: Long,
+    float: Float,
+    double: Double,
+    numeric: BigDecimal,
+    string: String,
+    byteString: ByteString,
+    timestamp: Instant,
+    date: LocalDate,
+    geography: Geography,
+    bigNumeric: BigNumeric,
+    nestedRequired: Nested,
+    nestedOptional: Option[Nested],
+    @description("COUNTRY") country: Country
   )
 
   // A record with no nested record types
@@ -76,12 +101,18 @@ object TypedBigQueryIT {
     numeric: BigDecimal,
     string: String,
     byteString: ByteString,
+    datetime: LocalDateTime,
     timestamp: Instant,
     date: LocalDate,
     time: LocalTime,
     geography: Geography,
-    json: Json,
-    bigNumeric: BigNumeric
+    bigNumeric: BigNumeric,
+    @description("COUNTRY") country: Country
+  )
+
+  @BigQueryType.toTable
+  case class RecordWithNonStringOverriddenType(
+    @description("NONNEGATIVEINT") nonNegativeInt: NonNegativeInt
   )
 
   def arbBigDecimal(precision: Int, scale: Int): Arbitrary[BigDecimal] = Arbitrary {
@@ -94,6 +125,12 @@ object TypedBigQueryIT {
   implicit val arbString: Arbitrary[String] = Arbitrary(Gen.alphaStr)
   implicit val arbByteString: Arbitrary[ByteString] = Arbitrary(
     Gen.alphaStr.map(ByteString.copyFromUtf8)
+  )
+  implicit val arbCountry: Arbitrary[Country] = Arbitrary(
+    Gen.listOfN(2, Gen.alphaChar).map(_.mkString).map(Country(_))
+  )
+  implicit val arbNonNegativeInt: Arbitrary[NonNegativeInt] = Arbitrary(
+    Gen.posNum[Int].map(new NonNegativeInt(_))
   )
   // Workaround for millis rounding error
   val epochGen: Gen[Long] = Gen.chooseNum[Long](0L, 1000000000000L).map(x => x / 1000 * 1000)
@@ -131,9 +168,6 @@ object TypedBigQueryIT {
       .map(BigNumeric.apply)
   }
 
-  private val recordGen =
-    implicitly[Arbitrary[Record]].arbitrary
-
   private def table(name: String) = {
     val TIME_FORMATTER = DateTimeFormat.forPattern("yyyyMMddHHmmss")
     val now = Instant.now().toString(TIME_FORMATTER)
@@ -141,14 +175,11 @@ object TypedBigQueryIT {
       s"data-integration-test:bigquery_avro_it.$name${now}_${Random.nextInt(Int.MaxValue)}"
     Table.Spec(spec)
   }
-  private val typedTableFileLoads = table("records_fileloads")
-  private val typedTableStorage = table("records_storage")
-  private val tableRowTable = table("records_tablerow")
-  private val avroTable = table("records_avro")
-  private val tableRowStorage = table("records_tablerow_storage")
-  private val avroFlatTable = table("records_avro_flat")
 
-  private val records = Gen.listOfN(5, recordGen).sample.get
+  def sample[T](gen: Gen[T]): Seq[T] = Gen.listOfN(5, gen).sample.get
+
+  val records = sample(implicitly[Arbitrary[Record]].arbitrary)
+
   private val options = PipelineOptionsFactory
     .fromArgs(
       "--project=data-integration-test",
@@ -162,143 +193,176 @@ class TypedBigQueryIT extends PipelineSpec with BeforeAndAfterAll {
 
   private val bq = BigQuery.defaultInstance()
 
-  override protected def afterAll(): Unit = {
-    // best effort cleanup
-    Try(bq.tables.delete(typedTableFileLoads.ref))
-    Try(bq.tables.delete(typedTableStorage.ref))
-    Try(bq.tables.delete(tableRowTable.ref))
-    Try(bq.tables.delete(avroTable.ref))
-    Try(bq.tables.delete(tableRowStorage.ref))
-    Try(bq.tables.delete(avroFlatTable.ref))
-  }
+  override protected def afterAll(): Unit =
+    bq.client
+      .execute(
+        _.tables().list("data-integration-test", "bigquery_avro_it")
+      )
+      .getTables
+      .forEach(t => bq.tables.delete(t.getTableReference))
 
-  "TypedBigQuery" should "write case classes using FileLoads API" in {
+  def testRoundtrip[T <: HasAnnotation: TypeTag: Coder, WF, RF](
+    writeFormat: Format[WF],
+    writeMethod: WriteMethod,
+    readFormat: Option[Format[RF]] = None
+  )(rows: Seq[T]): Unit = {
+    val tableRef = table(s"${writeFormat}_${writeMethod}".toLowerCase)
+    lazy val bqt = BigQueryType[T]
+
+    implicit val grCoder: Coder[GenericRecord] = avroGenericRecordCoder(bqt.avroSchema)
+
     runWithRealContext(options) { sc =>
-      sc.parallelize(records)
+      sc
+        .parallelize(rows)
         .saveAsTypedBigQueryTable(
-          typedTableFileLoads,
+          tableRef,
+          format = writeFormat,
           createDisposition = CREATE_IF_NEEDED,
-          method = WriteMethod.FILE_LOADS
+          method = writeMethod
         )
     }.waitUntilFinish()
 
-    runWithRealContext(options) { sc =>
-      val data = sc.typedBigQuery[Record](typedTableFileLoads)
-      data should containInAnyOrder(records)
+    // Assert that table schema matches type
+    val writtenSchema = bq.tables.table(tableRef.ref).getSchema
+    writtenSchema shouldEqual bqt.schema
+
+    // Assert that typed BQ successfully converted the overridden case class type to its primitive representation,
+    // not wrapped in a case class
+    writtenSchema.getFields.asScala.filter(_.getDescription == "COUNTRY").foreach { fieldSchema =>
+      fieldSchema.getType shouldEqual "STRING"
     }
-  }
+    writtenSchema.getFields.asScala.filter(_.getDescription == "NONNEGATIVEINT").foreach {
+      fieldSchema =>
+        fieldSchema.getType shouldEqual "INTEGER"
+    }
 
-  it should "write case classes using Storage Write API" in {
-    // Storage write API has a bug impacting TIME field writes: https://github.com/apache/beam/issues/34038
-    // Todo remove when fixed
-    the[IllegalArgumentException] thrownBy {
-      runWithRealContext(options) { sc =>
-        sc.parallelize(records)
-          .saveAsTypedBigQueryTable(
-            typedTableStorage,
-            createDisposition = CREATE_IF_NEEDED,
-            method = WriteMethod.STORAGE_WRITE_API
-          )
-      }.waitUntilFinish()
-
-      runWithRealContext(options) { sc =>
-        val data = sc.typedBigQuery[Record](typedTableStorage)
-        data should containInAnyOrder(records)
+    runWithRealContext(options) { sc =>
+      val data = readFormat match {
+        case Some(Format.TableRow) =>
+          sc
+            .bigQueryTable(tableRef, Format.TableRow)
+            .map(bqt.fromTableRow)
+        case Some(Format.GenericRecord) | Some(Format.GenericRecordWithLogicalTypes) =>
+          sc
+            .bigQueryTable(tableRef, Format.GenericRecordWithLogicalTypes)
+            .map(bqt.fromAvro)
+        case None =>
+          sc
+            .typedBigQuery[T](tableRef)
       }
-    } should have message "TIME schemas are not currently supported for Typed Storage Write API writes. Please use Write method FILE_LOADS instead, or map case classes using BigQueryType.toTableRow and use saveAsBigQueryTable directly."
-  }
-
-  it should "write case classes manually converted to TableRows using FileLoads API" in {
-    runWithRealContext(options) { sc =>
-      sc.parallelize(records)
-        .map(Record.toTableRow)
-        .map { row =>
-          // TableRow BQ save API uses json
-          // TO disambiguate from literal json string,
-          // field MUST be converted to parsed JSON
-          val jsonLoadRow = new TableRow()
-          jsonLoadRow.putAll(row.asInstanceOf[java.util.Map[String, _]]) // cast for 2.12
-          jsonLoadRow.set("json", Json.parse(row.getJson("json")))
-        }
-        .saveAsBigQueryTable(
-          tableRowTable,
-          schema = Record.schema,
-          createDisposition = CREATE_IF_NEEDED
-        )
-    }.waitUntilFinish()
-
-    runWithRealContext(options) { sc =>
-      val data = sc.bigQueryTable(tableRowTable).map(Record.fromTableRow)
-      data should containInAnyOrder(records)
+      data should containInAnyOrder(rows)
     }
   }
 
-  it should "write case classes manually converted to GenericRecords using FileLoads API" in {
-    implicit val coder: Coder[GenericRecord] = avroGenericRecordCoder(Record.avroSchema)
+  "TypedBigQuery" should "write case classes using TableRow representation and FileLoads API" in {
+    testRoundtrip(Format.TableRow, WriteMethod.FILE_LOADS)(records)
+  }
 
-    runWithRealContext(options) { sc =>
-      sc.parallelize(records)
-        .map(Record.toAvro)
-        .saveAsBigQueryTable(
-          avroTable,
-          schema = Record.schema, // This is a bad API. an avro schema should be expected
-          createDisposition = CREATE_IF_NEEDED
-        )
-    }.waitUntilFinish()
-
-    runWithRealContext(options) { sc =>
-      sc.typedBigQuery[Record](avroTable) should containInAnyOrder(records)
+  it should "fail to write case classes with a LocalDateTime field using GenericRecord representation and FileLoads API" in {
+    val error = intercept[PipelineExecutionException] {
+      testRoundtrip(Format.GenericRecordWithLogicalTypes, WriteMethod.FILE_LOADS)(records)
     }
 
+    error.getMessage should include(
+      "Field datetime has incompatible types. Configured schema: datetime; Avro file: string."
+    )
+  }
+
+  it should "write case classes using TableRow representation and Storage API" in {
+    testRoundtrip(Format.TableRow, WriteMethod.STORAGE_WRITE_API)(records)
+  }
+
+  // Storage write API has a bug impacting TIME field writes w/ GenericRecord format:
+  // https://github.com/apache/beam/issues/34038
+  // Todo remove special casing when fixed
+  it should "write case classes without LocalTime or LocalDateTime fields using GenericRecord representation and Storage API" in {
+    testRoundtrip(Format.GenericRecordWithLogicalTypes, WriteMethod.STORAGE_WRITE_API)(
+      sample(implicitly[Arbitrary[RecordNoTime]].arbitrary)
+    )
+  }
+
+  it should "write case classes with LocalTime fields using GenericRecord representation and Storage API" in {
+    testRoundtrip(Format.GenericRecordWithLogicalTypes, WriteMethod.STORAGE_WRITE_API)(records)
+  }
+
+  it should "read rows in TableRow format and manually convert to case classes" in {
+    testRoundtrip(
+      Format.GenericRecordWithLogicalTypes,
+      WriteMethod.STORAGE_WRITE_API,
+      Some(Format.TableRow)
+    )(sample(implicitly[Arbitrary[RecordNoTime]].arbitrary))
+  }
+
+  it should "read rows without nested record fields in GenericRecord format" in {
+    testRoundtrip(
+      Format.TableRow,
+      WriteMethod.STORAGE_WRITE_API,
+      Some(Format.GenericRecordWithLogicalTypes)
+    )(sample(implicitly[Arbitrary[FlatRecord]].arbitrary))
+  }
+
+  it should "fail on Json types for TableRow representation and FILE_LOADS write API" in {
+    the[IllegalArgumentException] thrownBy {
+      testRoundtrip(
+        Format.TableRow,
+        WriteMethod.FILE_LOADS
+      )(sample(implicitly[Arbitrary[JsonRecord]].arbitrary))
+    } should have message "JSON schemas are not supported for typed BigQuery writes using the FILE_LOADS API and TableRow representation. Please either use the STORAGE_WRITE_API method or GenericRecord Format."
+  }
+
+  it should "support Json types for GenericRecord representation and FILE_LOADS write API" in {
+    testRoundtrip(
+      Format.GenericRecord,
+      WriteMethod.FILE_LOADS
+    )(sample(implicitly[Arbitrary[JsonRecord]].arbitrary))
+  }
+
+  it should "support Json types for TableRow representation and STORAGE_WRITE_API API" in {
+    testRoundtrip(
+      Format.TableRow,
+      WriteMethod.STORAGE_WRITE_API
+    )(sample(implicitly[Arbitrary[JsonRecord]].arbitrary))
+  }
+
+  it should "support Json types for GenericRecord representation and STORAGE_WRITE_API API" in {
+    testRoundtrip(
+      Format.GenericRecord,
+      WriteMethod.STORAGE_WRITE_API
+    )(sample(implicitly[Arbitrary[JsonRecord]].arbitrary))
+  }
+
+  it should "fail to read rows with nested record fields in GenericRecord format" in {
     // Due to Beam bug with automatic schema detection, can't parse nested record types as GenericRecords yet
     // Todo remove assertThrows after fixing in Beam
     assertThrows[UnresolvedUnionException] {
-      runWithRealContext(options) { sc =>
-        val data =
-          sc.bigQueryTable(avroTable, format = GenericRecordWithLogicalTypes)
-            .map(Record.fromAvro)
-        data should containInAnyOrder(records)
-      }
+      testRoundtrip(
+        Format.TableRow,
+        WriteMethod.STORAGE_WRITE_API,
+        Some(Format.GenericRecordWithLogicalTypes)
+      )(records)
     }
   }
 
-  it should "write case classes manually converted to TableRows using Storage Write API" in {
-    runWithRealContext(options) { sc =>
-      sc.parallelize(records)
-        .map(Record.toTableRow)
-        .saveAsBigQueryTable(
-          tableRowStorage,
-          schema = Record.schema,
-          createDisposition = CREATE_IF_NEEDED,
-          method = WriteMethod.STORAGE_WRITE_API
-        )
-    }.waitUntilFinish()
-
-    runWithRealContext(options) { sc =>
-      sc.typedBigQuery[Record](tableRowStorage) should containInAnyOrder(records)
-    }
+  it should "support records that use OverrideTypeProvider for non-string fields using TableRow representation" in {
+    testRoundtrip(
+      Format.TableRow,
+      WriteMethod.FILE_LOADS,
+      Some(Format.TableRow)
+    )(sample(implicitly[Arbitrary[RecordWithNonStringOverriddenType]].arbitrary))
   }
 
-  it should "read BigQuery rows into GenericRecords and convert them to case classes for records without nested types" in {
-    implicit val coder: Coder[GenericRecord] = avroGenericRecordCoder(FlatRecord.avroSchema)
-
-    val flatRecords = Gen.listOfN(5, implicitly[Arbitrary[FlatRecord]].arbitrary).sample.get
-
-    runWithRealContext(options) { sc =>
-      sc.parallelize(flatRecords)
-        .map(FlatRecord.toAvro)
-        .saveAsBigQueryTable(
-          avroFlatTable,
-          schema = FlatRecord.schema,
-          createDisposition = CREATE_IF_NEEDED
-        )
-    }.waitUntilFinish()
-
-    runWithRealContext(options) { sc =>
-      val data =
-        sc.bigQueryTable(avroFlatTable, Format.GenericRecordWithLogicalTypes)
-          .map(FlatRecord.fromAvro)
-      data should containInAnyOrder(flatRecords)
+  // See https://github.com/spotify/scio/issues/5644
+  it should "fail on records that use OverrideTypeProvider for non-string fields using GenericRecord representation" in {
+    val error = intercept[PipelineExecutionException] {
+      testRoundtrip(
+        Format.GenericRecord,
+        WriteMethod.FILE_LOADS,
+        Some(Format.TableRow)
+      )(sample(implicitly[Arbitrary[RecordWithNonStringOverriddenType]].arbitrary))
     }
+
+    error.getMessage should include(
+      "org.apache.avro.file.DataFileWriter$AppendWriteException: java.lang.ClassCastException"
+    )
   }
 }

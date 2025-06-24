@@ -21,9 +21,8 @@ import com.google.api.services.bigquery.model.TableSchema
 import com.spotify.scio.bigquery.BigQueryTyped.Table.{WriteParam => TableWriteParam}
 import com.spotify.scio.bigquery.BigQueryTypedTable.{Format, WriteParam => TypedTableWriteParam}
 import com.spotify.scio.bigquery.TableRowJsonIO.{WriteParam => TableRowJsonWriteParam}
-import com.spotify.scio.bigquery.types.BigQueryType.HasAnnotation
-import com.spotify.scio.bigquery.coders
 import com.spotify.scio.bigquery._
+import com.spotify.scio.bigquery.types.BigQueryType.HasAnnotation
 import com.spotify.scio.coders.Coder
 import com.spotify.scio.io._
 import com.spotify.scio.util.FilenamePolicySupplier
@@ -201,7 +200,8 @@ final class SCollectionGenericRecordOps[T <: GenericRecord](private val self: SC
       configOverride
     )
     if (
-      BigQueryUtil.isStorageApiWrite(method) && Option(schema).exists(BigQueryUtil.containsTimeType)
+      BigQueryUtil
+        .isStorageApiWrite(method) && Option(schema).exists(BigQueryUtil.containsType(_, "TIME"))
     ) {
       // Todo remove once https://github.com/apache/beam/issues/34038 is fixed
       throw new IllegalArgumentException(
@@ -279,33 +279,37 @@ final class SCollectionTypedOps[T <: HasAnnotation](private val self: SCollectio
     failedInsertRetryPolicy: InsertRetryPolicy = TableWriteParam.DefaultFailedInsertRetryPolicy,
     successfulInsertsPropagation: Boolean = TableWriteParam.DefaultSuccessfulInsertsPropagation,
     extendedErrorInfo: Boolean = TableWriteParam.DefaultExtendedErrorInfo,
-    configOverride: TableWriteParam.ConfigOverride[T] = TableWriteParam.DefaultConfigOverride
+    configOverride: TableWriteParam.ConfigOverride[T] = TableWriteParam.DefaultConfigOverride,
+    format: Format[_] = TableWriteParam.DefaultFormat
   )(implicit tt: TypeTag[T], coder: Coder[T]): ClosedTap[T] = {
-    val param = TableWriteParam[T](
-      method,
-      writeDisposition,
-      createDisposition,
-      timePartitioning,
-      clustering,
-      triggeringFrequency,
-      sharding,
-      failedInsertRetryPolicy,
-      successfulInsertsPropagation,
-      extendedErrorInfo,
-      configOverride
-    )
+    val bqt = BigQueryType[T]
 
     if (
-      BigQueryUtil
-        .isStorageApiWrite(method) && BigQueryUtil.containsTimeType(BigQueryType[T].schema)
+      format == Format.TableRow && method == Method.FILE_LOADS && BigQueryUtil.containsType(
+        bqt.schema,
+        "JSON"
+      )
     ) {
-      // Todo remove once https://github.com/apache/beam/issues/34038 is fixed
       throw new IllegalArgumentException(
-        "TIME schemas are not currently supported for Typed Storage Write API writes. Please use Write method FILE_LOADS instead, or map case classes using BigQueryType.toTableRow and use saveAsBigQueryTable directly."
+        "JSON schemas are not supported for typed BigQuery writes using the FILE_LOADS API and TableRow representation. Please either use the STORAGE_WRITE_API method or GenericRecord Format."
       )
     }
 
-    self.write(BigQueryTyped.Table[T](table))(param)
+    self.write(BigQueryTyped.Table[T](table, format))(
+      TableWriteParam(
+        method,
+        writeDisposition,
+        createDisposition,
+        timePartitioning,
+        clustering,
+        triggeringFrequency,
+        sharding,
+        failedInsertRetryPolicy,
+        successfulInsertsPropagation,
+        extendedErrorInfo,
+        configOverride
+      )
+    )
   }
 }
 
